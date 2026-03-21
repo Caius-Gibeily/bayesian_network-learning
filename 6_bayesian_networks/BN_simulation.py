@@ -13,8 +13,8 @@ from pgmpy.sampling import BayesianModelSampling
 from pgmpy.factors.discrete import State
 
 import matplotlib.pyplot as plt
-os.chdir("C:\\Users\\cgibeil@emory.edu\\OneDrive - Emory\\Documents\\PhD\\Projects\\P1-CondProbs\\Core_scripts\\Cellular_targets_pipeline")
-import bnfunctions2 as bn
+os.chdir("C:\\Users\\cgibeil@emory.edu\\OneDrive - Emory\\Documents\\PhD\\Projects\\P1-CondProbs\\bn_analyses\\6_bayesian_networks\\")
+import BN_functions as bn
 import logging
 
 
