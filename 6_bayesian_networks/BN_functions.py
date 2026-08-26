@@ -739,6 +739,21 @@ def plot_edge_thresh(scores,threshes,thresh):
 
 #%% Model evaluation
 def js_distance(p,q):
+    """
+    Compute Jensen-Shannon distance between two reference probability mass functions, p and q
+    Parameters
+    ----------
+    p : list 
+        first p.m.f.
+    q : list
+        second p.m.f.
+
+    Returns
+    ----------
+    float 
+        Jensen-Shannon distance
+
+    """
     from scipy.spatial import distance
     if np.isnan(p).any() or np.isnan(q).any():
         return np.nan
@@ -746,6 +761,21 @@ def js_distance(p,q):
         return distance.jensenshannon(p, q)
 
 def compare_recovered_ppds(model1,model2, fun=np.mean):
+    """
+    Compares posterior probability difference between each pair of equivalent nodes across two pgmpy.DiscreteBayesianNetwork models, model1 and model2
+
+    Parameters
+    ----------
+    model1 : pgmpy.DiscreteBayesianNetwork
+    model2 : pgmpy.DiscreteBayesianNetwork
+    fun : function
+        Summary function, default = np.mean
+
+    Returns 
+    ----------
+    float
+        summary difference of the two models
+    """
     from pgmpy.inference import CausalInference
     variables = model1.nodes()
     variables2 = model2.nodes()
@@ -781,7 +811,21 @@ def compare_recovered_ppds(model1,model2, fun=np.mean):
 
 
 def hamming_distance(adj1,adj2,directed=True):
+    """
+    Compares structural Hamming distance between two adjacency matrices, adj1 and adj2
 
+    Parameters
+    ----------
+    adj1 : pgmpy.DAG
+    adj2 : pgmpy.DAG
+    directed : Boolean
+        whether the adjacency matrices represent digraphs
+
+    Returns 
+    ----------
+    float
+        Hamming distance [0,1]
+    """
     if not directed:
         T = np.triu(adj1 + adj1.T, 1)
         P = np.triu(adj2 + adj2.T, 1)
@@ -794,171 +838,149 @@ def hamming_distance(adj1,adj2,directed=True):
         possible = adj1.size
     return raw / possible
 
-#%% Model prediction
+import numpy as np
+import pandas as pd
 
-def predictBayes(data, adj, model, size=1e5, n_jobs=-1,
-            cond = "evidence",alpha=1,seed = None):
+
+def _cpd_log_prob(cpd, values_by_var, alpha=1, fallback_prior=None):
     """
+    Exact lookup of P(node = observed | parents = observed) from a fitted
+    pgmpy TabularCPD, using the CPD's own stored array rather than sampling.
+
     Parameters
     ----------
-    data : state-matrix dataframe object 
-    adj : adjacency matrix 
-    model : the BN model for which prediction is performed
-    size : size of likelihood-weighted sample to pull for each prediction
-    n_jobs : optional, specifies the number of computing cores to use
-    cond : optional, which model setup to use, M0, M1 or M2
-    alpha : the prior set on each state. By default = 1
-    seed : optional, seed is set `get_all_predictions` for reproducibility
+    cpd : pgmpy.factors.discrete.TabularCPD
+        The fitted CPD for a single node (as stored in model.get_cpds(node)).
+    values_by_var : dict[str, str]
+        Observed state (as a string) for every variable in cpd.variables
+        (the node itself plus its parents, in whatever order pgmpy stored
+        them — we read that order directly from cpd.variables so we never
+        have to assume it matches epoch/column order elsewhere).
+    alpha : float
+        Pseudo-count used only for the fallback path below.
+    fallback_prior : dict[str, float] or None
+        Optional precomputed (state -> smoothed frequency) fallback, used
+        only if the observed state combination was never seen in training
+        (e.g. a rare state that didn't appear for any other participant in
+        this LOO fold). If None, falls back to a small floor probability.
 
     Returns
     -------
-    pred : set of all predictions for the query movie clip and group
+    prob : float
+        P(node = observed | parents = observed), a real probability read
+        directly from the CPD table (not an importance-weighted estimate).
     """
-    from pgmpy.factors.discrete import State
-    from joblib import Parallel, delayed
-    from pgmpy.sampling import BayesianModelSampling
-    
+    try:
+        idx = []
+        for var in cpd.variables:
+            state_list = cpd.state_names[var]
+            idx.append(state_list.index(values_by_var[var]))
+        prob = float(cpd.values[tuple(idx)])
+        # Guard against a structurally-present-but-zero-mass entry (can
+        # happen with unsmoothed ML-fit CPDs on sparse data).
+        if prob <= 0 or not np.isfinite(prob):
+            raise ValueError
+        return prob
+    except (KeyError, ValueError):
+        # Observed state (or a parent's observed state) was never seen
+        # for this variable during training for this LOO fold. Fall back
+        # to an alpha-smoothed frequency if provided, else a small floor.
+        if fallback_prior is not None:
+            node = cpd.variables[0]
+            return float(fallback_prior.get(values_by_var[node], 1e-16))
+        return 1e-16
 
-    pred = np.zeros([data.shape[0], data.shape[1]])
-    model_preds= []
-    if cond == "forder": # M1 condition with only first-order edges
-        # Convert model adjacency matrix into a numpy array
-        adj = DAG2adj(model)
-        # Extract only the first-order edges from the model
-        adj[~np.eye(adj.shape[0], dtype=bool,k=1)] = 0
-        # Convert adjacency matrix back into DAG
+
+def predictBayes(data, adj, model, cond="evidence", alpha=1, seed=None):
+    """
+
+    Parameters
+    ----------
+    data : state-matrix dataframe object (rows = participants, columns =
+        epochs). Index need not be 0..n-1 on entry -- it is normalised
+        internally.
+    adj : adjacency matrix (used to build the M0/M2 structure via
+        adj2DAG; ignored for "forder", which derives its own truncated
+        structure from `model`).
+    model : the fitted pgmpy DiscreteBayesianNetwork for this clip/group,
+        used only to recover the DAG structure for the "forder" (M1)
+        condition via DAG2adj(model).
+    cond : "rand" (M0, state-frequency null model), "forder" (M1,
+        first-order-edges-only model), or "evidence" (M2, full model).
+    alpha : Dirichlet pseudo-count for the M0 / fallback frequency estimate.
+    seed : unused (kept only for call-site compatibility with
+        get_all_predictions, which still passes it).
+
+    Returns
+    -------
+    pred : ndarray, shape (n_participants, n_epochs)
+        Per-epoch log10 predictive probability for each held-out
+        participant's actually-observed state.
+
+    Notes
+    -----
+    Each participant's sequence is fully observed, so the joint probability
+    of that sequence factorises exactly as the product (sum, in log space)
+    of each node's own CPD evaluated at its actual parents' observed
+    values. There is no latent variable to integrate over.
+
+    """
+    data = data.reset_index(drop=True)
+    epochs = list(data.columns)
+    n = data.shape[0]
+
+    pred = np.zeros([n, len(epochs)])
+
+    if cond == "forder":  # M1: first-order edges only
+        base_adj = DAG2adj(model)
+        base_adj[~np.eye(base_adj.shape[0], dtype=bool, k=1)] = 0
+        dag = adj2DAG(base_adj)
+    elif cond in ("evidence", "rand"):  # M2 (full) or M0 (null)
         dag = adj2DAG(adj)
+    else:
+        raise ValueError(f"Unrecognised cond: {cond!r}")
 
-        # LOO parameter learning. Using the same bootstrapped structure, 
-        # refit the model parameters leaving each participant out a time 
-        for i in range(data.shape[0]): # for each participant
-            
-            data_train = data.drop(i) # drop that participant from the training 
-            model_preds.append(learn_parameters(data_train, dag))
+    for i in range(n):
+        samp = data.iloc[i]
+        data_train = data.drop(i)
 
-        
-        
-    elif cond == "evidence" or cond == "rand": # M2 or M0 conditions
+        epoch_fallback = {}
+        for ep in epochs:
+            states, counts = np.unique(data_train[ep].astype(str), return_counts=True)
+            smoothed = (counts + alpha) / (np.sum(counts) + states.size * alpha) # smoothed Dirichlet prior
+            epoch_fallback[ep] = dict(zip(states, smoothed))
 
-        for i in range(data.shape[0]):
-            data_train = data.drop(i)
-            model_preds.append(learn_parameters(data_train, adj2DAG(adj)))
+        if cond == "rand":
+            model_rec = None 
+        else:
+            model_rec = learn_parameters(data_train, dag)
 
-    def predict_row(i, samp, model_rec, adj_rec,data_train,size): # predict each 
-        # participant's state sequence
-        
+        row_pred = np.zeros(len(epochs))
+        for node in epochs:
+            obs_state = str(samp[node])
 
-        rng = np.random.default_rng(seed)
-        
-        inference = BayesianModelSampling(model_rec)
-        
-        row_pred = np.zeros(data.shape[1])
-        
-        epochs = data_train.columns
+            if cond == "rand": 
+                prob = epoch_fallback[node].get(obs_state, 1e-16)
 
-        for j,node in  enumerate(model_rec.nodes): # For each epoch, 
+            else:  
+                cpd = model_rec.get_cpds(node)
+                parents = cpd.variables[1:] 
 
-            if cond == "rand": # For M0, find the frequencies of all the states in the epoch
-                states,prior_dist = np.unique(data_train.iloc[:,j],
-                                          return_counts= True)
-                #Specify alpha as the prior set on the null model for each state 
-                #Dirichlet prior is the conjugate prior of the categorical distribution. The 
-                #Updated probabilities are given for each state i as 
-                #n_{state,i} + alpha / sum(n_{states}) + (alpha)
-                
-                null_posterior = (prior_dist+alpha)/(np.sum(prior_dist) + states.size * alpha)
-                
-                # which state did the participant enter
-                
-                # log-likelihood
-                samp_state = str(samp.iloc[j])
-                mask = states == samp_state
-                idx = np.where(mask)[0]
-                
-                if len(idx) == 1:
-                    row_pred[j] = np.log10(null_posterior[idx[0]]+1e-16)
-                else:
-                    row_pred[j] = np.log10(1e-16) 
-                    
-            else: # if not M0 (M1/M2)
-                # for the first epoch with no history
-                if j == 0: #len(parents) == 0:
-                    
-                    # generate a simulated dataframe given the model parameters.
-                    df_sim = inference.likelihood_weighted_sample(
-                         size=size, show_progress=False
-                    )
-                
-                else:
-                    # for subsequent epochs
-                    history = epochs[0:j]
-                    parent_states = samp.iloc[:]
-                    evidence = [
-                        State(var=str(pid), state=parent_states.iloc[n])
-                        for n, pid in enumerate(history)
-                    ]
-                     
-                    # generate likelihood-weighted samples after setting the participant's 
-                    # state history 
-    
-                    df_sim = inference.likelihood_weighted_sample(
-                         size=size, show_progress=False, evidence=evidence
-                    )
-                    
-               
-                samples = df_sim.iloc[:, j].astype(str)
-                weights = df_sim["_weight"].values
-                
-                post_dist = {}
-                for s, w in zip(samples, weights):
-                    post_dist[s] = post_dist.get(s, 0.0) + w
+                values_by_var = {node: obs_state}
+                for p in parents:
+                    values_by_var[p] = str(samp[p])
 
-                
-                Z = sum(post_dist.values())
-                if Z <= 0 or not np.isfinite(Z):
-                    # Default to null if likelihoods low
-                    states,prior_dist = np.unique(data_train.iloc[:,j],
-                                              return_counts= True)
-                    # as before for M0
-                    null_posterior = (prior_dist+alpha)/(np.sum(prior_dist) + 
-                                                         states.size * alpha)
-                    
-                    mask = states == samp_state
-                    idx = np.where(mask)[0]
-                    
-                    if len(idx) == 1:
-                        row_pred[j] = np.log10(null_posterior[idx[0]]+1e-16)
-                    else:
-                        row_pred[j] = np.log10(1e-16) 
-                    
-                    continue                
-                
-                else:
-                    for s in post_dist:
-                        post_dist[s] /= Z
-                
-                samp_state = str(samp.iloc[j])
-                prob = post_dist.get(samp_state, 0.0)
-  
-                
-                row_pred[j] = np.log10(prob+1e-16)
+                prob = _cpd_log_prob(
+                    cpd, values_by_var, alpha=alpha,
+                    fallback_prior=epoch_fallback[node],
+                )
 
-        return i, row_pred
-
-    # Parallel processing 
-    results = Parallel(n_jobs=n_jobs, verbose=False)(
-        delayed(predict_row)(
-            i, samp, model_preds[i], adj, data_train,int(size))
-        
-    for i, samp in data.iterrows()
-    )
-
-    for i, row_pred in results:
+            row_pred[epochs.index(node)] = np.log10(prob + 1e-16)
 
         pred[i, :] = row_pred
 
     return pred
-
+    
 def get_all_predictions(clips,data,nreps):
     
     """
@@ -1065,6 +1087,17 @@ def get_all_predictions(clips,data,nreps):
     return preds
 
 def plot_predictions(preds):
+    """
+    Plot cumulative distribution function of log-Bayes factors (BFs) across TD and ASD participants
+    Parameters
+    ----------
+    preds : pandas.DataFrame
+
+    Returns 
+    ----------
+    mediandat : pandas.DataFrame
+        Median log-BFs by diagnostic group and clip
+    """
     import seaborn as sns
     preds["pred_array_logsum"] = preds["pred_array"].apply(np.sum,axis=1)
 
@@ -1159,102 +1192,7 @@ def plot_predictions(preds):
 
 #%% Causal inference
 
-
-"""
-def calcStateChanges(model,data,mask_array=True,
-                     show=True,vsamp=1e4,thresh=0.2,**kwargs):
-    
-
-    from pgmpy.inference import CausalInference
-    from pgmpy.factors.discrete import TabularCPD
-    import string
-    
-    model_infer = CausalInference(model)
-    
-    epochs = list(string.ascii_uppercase)
-    
-    mvars = list(model.nodes)
-    
-    nrows = np.sum([len(model.states[node]) for node in mvars])
-    ncols = len(mvars)
-    
-    statearray = np.full((nrows, ncols),np.nan)
-    ratioarray = np.full((nrows, ncols),np.nan)
-    
-    row_parent_idx = []
-    row_labels = []
-    row_state_boundaries = []
-    
-    c = 0
-    for n, node in enumerate(mvars):
-        start_c = c
-        for s,state in enumerate(model.states[node]):
-            row_parent_idx.append(n)
-            row_labels.append(f"{epochs[n]}={s+1}")
-    
-            for j, lnode in enumerate(mvars):
-                if j <= n:
-                    continue
-    
-                evidence = {node: state}
-                ppds1 = model_infer.query([lnode], do=evidence)
-                
-                states, counts = np.unique(
-                    data.iloc[:, n], return_counts=True
-                )
-                #counts = counts / counts.sum()
-                counts[s] = 0
-                counts = counts / counts.sum()
-
-                counterfactual = TabularCPD(variable=node,
-                          variable_card=len(model.states[node]),
-                          values=[[counts[k]] for k in range(len(counts))],
-                          state_names={node: model.states[node]})
-                
-                ppds0_samp = model.simulate(n_samples=int(vsamp),virtual_intervention=[counterfactual])
-                states0,ppds0 = np.unique(ppds0_samp[lnode],return_counts=True)
-                ppds0 = ppds0 / ppds0.sum()
-                #ppd_states = list(ppds.state_names.values())[0]
-    
-                
-
-                ppd1_states = list(ppds1.state_names.values())[0]
-                
-                ppd0_idx = {state: ppds0[i] for i, state in enumerate(states0)}
-
-                ppds0 = [
-                    ppd0_idx[state] if state in states0 else 0
-                    for state in ppd1_states
-                ]
-                
-                  
-                
-                #max_idx = np.argmax(all_ppds)
-                
-                deltaP = ppds1.values - ppds0
-                #max_idx = np.argmax(ppds1.values)
-                max_idx = np.argmax(deltaP)
-                
-                statearray[c, j] = max_idx
-                #ratioarray[c, j] = ppds1.values[max_idx]/ppds0[max_idx]#*np.sum(counts[~s]) #all_ppds[max_idx] / counts[max_idx]
-                ratioarray[c, j] = deltaP[max_idx]
-            c += 1
-    
-        end_c = c
-        row_state_boundaries.append((start_c, end_c))
-    
-    if mask_array:
-        neutral = ratioarray < thresh #(ratioarray < 1.5) #& (ratioarray < 1.1)
-        statearray[neutral] = np.nan
-        ratioarray[neutral] = np.nan
-    
-    row_parent_idx = np.array(row_parent_idx)
-    return statearray,ratioarray,row_parent_idx,ncols,nrows,mvars,row_state_boundaries,epochs,row_labels
-"""
-
-
-def calc_counterfactuals(data,model,epochs,p,clip,vsamp=1e4):
-    
+def calc_interventions(data,model,epochs,p,clip,vsamp=1e4):
     from pgmpy.inference import CausalInference
     from pgmpy.factors.discrete import TabularCPD
     model_infer = CausalInference(model)
@@ -1312,8 +1250,8 @@ def calc_counterfactuals(data,model,epochs,p,clip,vsamp=1e4):
                 ppd0_idx = {state: ppds0[i] for i, 
                             state in enumerate(states0)}
                 
-                ppds0 = [ ppd0_idx[state] if state in states0 else 
-                         0 for state in ppd1_states ]
+                ppds0 = [ppd0_idx[state] if state in states0 else 
+                         0 for state in ppd1_states]
 
                   
                 
@@ -1349,7 +1287,7 @@ def calc_state_changes(data,model,clip,vsamp=1e4,resample="bootstrap",**kwargs):
     if resample == "jackknife":
         for p in range(data.shape[0]):
             data_resampled = data.drop(p)
-            ratioarray,row_parent_idx,ncols,nrows,mvars,row_state_boundaries,epochs,row_labels = calc_counterfactuals(data_resampled,model,epochs,p,clip)
+            ratioarray,row_parent_idx,ncols,nrows,mvars,row_state_boundaries,epochs,row_labels = calc_interventions(data_resampled,model,epochs,p,clip)
             ratioarrays.extend(ratioarray)
 
     elif resample == "bootstrap":
@@ -1357,13 +1295,13 @@ def calc_state_changes(data,model,clip,vsamp=1e4,resample="bootstrap",**kwargs):
             bootID = np.random.choice(data.shape[0],data.shape[0],replace=True)
             data_resampled = data.iloc[bootID,:]
             model_adj = learn_parameters(data_resampled, model)
-            ratioarray,row_parent_idx,ncols,nrows,mvars,row_state_boundaries,epochs,row_labels = calc_counterfactuals(data_resampled,model_adj,epochs,p,clip,vsamp=vsamp)
+            ratioarray,row_parent_idx,ncols,nrows,mvars,row_state_boundaries,epochs,row_labels = calc_interventions(data_resampled,model_adj,epochs,p,clip,vsamp=vsamp)
             ratioarrays.extend(ratioarray)
 
     return ratioarrays
 
-    
-    
+
+"""    
 def plotStateChanges(statearray,ratioarray,
                      row_parent_idx,ncols,nrows,mvars,
                      row_state_boundaries,
@@ -1390,11 +1328,7 @@ def plotStateChanges(statearray,ratioarray,
         ratio_vals = ratio_vals[mask]
         
         ###
-        ratio_vals = np.clip(
-            ratio_vals,
-            0,
-            np.nanpercentile(ratio_vals, 99)
-        )
+        ratio_vals = np.clip(ratio_vals,0,np.nanpercentile(ratio_vals, 99))
         sf = 30
         sizes = (sf * ratio_vals)**2 
         ##
@@ -1403,26 +1337,14 @@ def plotStateChanges(statearray,ratioarray,
         
         n_states = len(state_colors)
         
-        norm_states = BoundaryNorm(
-            boundaries=np.arange(-0.5, n_states + 0.5),
-            ncolors=n_states
-        )
+        norm_states = BoundaryNorm(boundaries=np.arange(-0.5, n_states + 0.5),ncolors=n_states)
         
         if fig is None:
             fig, ax = plt.subplots(figsize=(10, 14))
             ax.set_aspect("equal")
             
-        sc = ax.scatter(
-            x,
-            y,
-            s=sizes,
-            c=state_vals,
-            cmap=cmap_states,
-            norm=norm_states,
-            edgecolors="none",
-            alpha=0.9,
-            zorder=2
-        )
+        sc = ax.scatter(x, y,
+            s=sizes,c=state_vals,cmap=cmap_states,norm=norm_states,edgecolors="none",alpha=0.9,zorder=2)
         
         for i in range(nrows):
             for j in range(row_parent_idx[i] + 1, ncols):
@@ -1434,13 +1356,9 @@ def plotStateChanges(statearray,ratioarray,
         v = len(mvars)-1
         for start, end in row_state_boundaries[:-1]:
             yline = end - 0.5
-            ax.plot(
-                [ncols - v -0.5,len(mvars)],
-                [yline, yline],
-                color="black",
-                lw=2.5,
-                zorder=3
-            )
+            ax.plot([ncols - v -0.5,len(mvars)],
+                [yline, yline],color="black",
+                lw=2.5,zorder=3)
             v-=1
         
      
@@ -1459,17 +1377,12 @@ def plotStateChanges(statearray,ratioarray,
         ###################
         color_handles = [
             Line2D(
-                [0], [0],
-                marker='o',
-                linestyle='None',
-                label=f"State {i+1}",
-                markerfacecolor=state_colors[i],
-                markeredgecolor='none',
-                markersize=12
-            )
+                [0], [0], marker='o',
+                linestyle='None',label=f"State {i+1}",
+                markerfacecolor=state_colors[i],markeredgecolor='none',markersize=12)
             for i in range(n_states)
         ]
-        """
+        
         color_legend = ax.legend(
             handles=color_handles,
             frameon=False,
@@ -1481,107 +1394,205 @@ def plotStateChanges(statearray,ratioarray,
         )
         
         ax.add_artist(color_legend) 
-        """
-        ratio_levels = np.array([
-            0.2,
-            0.5,
-            0.8,
-        ])
+        
+        ratio_levels = np.array([0.2,0.5,0.8,])
         
         ratio_levels = np.round(ratio_levels, 2)
         ##
-        size_handles = [
-            Line2D(
-                [0], [0],
-                marker='o',
-                linestyle='None',
-                color='gray',
-                alpha=0.8,
-                markersize=np.sqrt(
-                    (sf * r)**2 
-                ),
-                label=f"{r}"
-            )
+        size_handles = [Line2D([0], [0],
+                marker='o',linestyle='None',
+                color='gray',alpha=0.8,
+                markersize=np.sqrt((sf * r)**2),
+                label=f"{r}")
             for r in ratio_levels
         ]
         
-        ax.legend(
-            handles=size_handles,
-            title="Ratio",
-            frameon=False,
-            bbox_to_anchor=(1.02, 0.55),
-            loc="lower left",
-            handletextpad=1.0,
-            labelspacing=1.2
-        )
+        ax.legend(handles=size_handles, title="Ratio",
+            frameon=False, bbox_to_anchor=(1.02, 0.55),
+            loc="lower left", handletextpad=1.0,
+            labelspacing=1.2)
         ######################
         if "overlap" in kwargs:
             rgba = np.zeros((*statearray.shape, 4))
             rgba[kwargs["overlap"] == 1] = [1.0, 0.75, 0.8, 1.0]
     
-            ax.imshow(
-                rgba,
-                alpha=0.5, zorder=1
-                )
+            ax.imshow(rgba,
+                alpha=0.5, zorder=1)
     
     
         plt.tight_layout()
+"""
 
 
-def quantify_cons_overlap(causal_infTD,causal_infASD,overlap):
-    n_epochs = causal_infTD[3]
-    overlap_col = np.zeros((n_epochs,n_epochs))
-    td_col =np.zeros((n_epochs,n_epochs))
-    asd_col = np.zeros((n_epochs,n_epochs))
-    for j in range(n_epochs):
-        overlap_col[j,:] += np.nansum(overlap[causal_infTD[2]==j,:],0)
-        td_col[j,:] += np.nansum(causal_infTD[1][causal_infTD[2]==j,:]>0,0)
-        asd_col[j,:] += np.nansum(causal_infASD[1][causal_infASD[2]==j,:]>0,0)
+def format_df(df,epochs):
+    """
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Wide-format input DataFrame containing:
+    epochs : list or array-like
+        List of epoch labels or identifiers. 
+    Returns
+    -------
+    df_range : pandas.DataFrame
+        Processed DataFrame containing aggregated metrics and plotting metadata
+    x_levels : list
+        List of unique child node levels used for the x-axis, derived from epochs[1:].
+    y_levels : list
+        List of unique unique y_label values maintaining original insertion order.
+    """
+    df_long = df.melt(
+        id_vars=["p", "p_node", "c_node", "state"],
+        var_name="child_state",
+        value_name="delta_p").dropna()
+
+    df_long["child_state"] = df_long["child_state"].astype(int)
+
+
+    df_range = (df_long
+        .groupby(["p_node", "c_node", "state", "child_state"])
+        .agg(dmin=("delta_p", lambda x: x.quantile(0.01)),
+             dmax=("delta_p", lambda x: x.quantile(0.99)),
+             dmedian=("delta_p", lambda x: x.quantile(0.5)))
+        .reset_index())
+    df_range["plot"] = (0 > df_range["dmin"]) & (0 < df_range["dmax"])
+    
+    df_range["y_label"] = df_range["p_node"] + "=" + df_range["state"].astype(str)
+    y_levels = list(dict.fromkeys(df_range["y_label"]))
+    y_map = {k: i for i, k in enumerate(y_levels)}
+    df_range["y"] = df_range["y_label"].map(y_map)
+
+
+    x_levels = epochs[1:]
+    x_map = {k: i for i, k in enumerate(x_levels)}
+    df_range["x"] = df_range["c_node"].map(x_map)
+    return df_range,x_levels,y_levels
+
+import matplotlib.pyplot as plt
+
+def prepare_deltaP_df(epochs,clip):
+    
+    ratioarrays_TD = load_pickle(f"data\\deltaP_{clip}_TD")
+    ratioarrays_ASD = load_pickle(f"data\\deltaP_{clip}_ASD")
+    df_TD = pd.DataFrame(ratioarrays_TD)
+    df_ASD = pd.DataFrame(ratioarrays_ASD)
+    
+    df_range_TD,x_levels,y_levels = format_df(df_TD,epochs)
+    df_range_ASD,_,_ = format_df(df_ASD,epochs)
+    
+    
+    group_cols = ["p_node", "c_node", "state"]
+    summary_TD = (df_range_TD
+        .loc[df_range_TD.groupby(group_cols)["dmedian"].idxmax()][group_cols + ["child_state", "plot"]]
+        .rename(columns={"child_state": "max_state_TD",
+            "plot": "TD_crosses_zero"}))
+    
+    summary_ASD = (
+        df_range_ASD
+        .loc[df_range_ASD.groupby(group_cols)["dmedian"].idxmax()]
+        [group_cols + ["child_state", "plot"]]
+        .rename(columns={"child_state": "max_state_ASD",
+                         "plot": "ASD_crosses_zero"}))
+    summary = summary_TD.merge(summary_ASD, on=group_cols, how="inner")
+    summary["shared"] = (summary["max_state_TD"] == summary["max_state_ASD"])
+    
+    summary["both"] = (~summary["TD_crosses_zero"] & ~summary["ASD_crosses_zero"])
+    
+    summary["comp"] = summary["shared"] & summary["both"]
+
+    return df_range_TD,df_range_ASD,summary_TD,summary,x_levels,y_levels
+
+
+#%%
+
+def plot_deltaPs(df_range,summary,x_levels,y_levels,tile_halfwidth=0.8,scale = 1):
+    """
+    Plot changes in probability of each state given interventions on prior states, using the object generated from format_df()
+    
+    Parameters
+    ----------
+    df_range : pandas.DataFrame
+        Processed DataFrame containing aggregated metrics and plotting metadata
+    summary : 
+        Summary dataframe containing information on parent and child state and whether the 99th % confidence interval crosses 0 
+    x_levels : figure data; x positions for drawing rects 
+    y_levels : figure data; y positions for drawing rects
+
+    tile_halfwidth float
+        determines the width of each tile rect
+    scale float
         
-    td_col -= overlap_col
-    asd_col -= overlap_col
-    
-    overlap_dist = np.zeros(n_epochs-1)
-    td_dist = np.zeros(n_epochs-1)
-    asd_dist = np.zeros(n_epochs-1)
-    
-    for j in range(n_epochs-1):
-        overlap_dist[j] = np.sum(np.linalg.diagonal(overlap_col, offset=j+1))
-        td_dist[j] = np.sum(np.linalg.diagonal(td_col, offset=j+1))
-        asd_dist[j] = np.sum(np.linalg.diagonal(asd_col, offset=j+1))
-    
-    return n_epochs,overlap_dist,td_dist,asd_dist
+    Returns
+    -------
+    None
+    """
 
-def plotStateChanges_perclip(datadir,clips,venn=False):
-    dist_deltas = []
+    
+    fig, ax = plt.subplots(figsize=(10,20))
+    
+    # color per child state
+    colors = {0: "red", 1: "blue", 2: "green", 3: "orange"}
+    
+    # vertical offsets inside each tile
+    offsets = {0: 0.25, 1: 0.08, 2: -0.08, 3: -0.25}
+    
+    priorset = 0
+    for i, row in df_range.iterrows():
+        if row["plot"]: continue
+        currset = row["p_node"] + row["c_node"] + str(row["state"])
+        
+        x = row["x"]
+        y = row["y"]
+    
+        if (priorset != currset):
+            if summary[(summary["p_node"]==row["p_node"]) & (summary["c_node"]==row["c_node"]) & (summary["state"]==row["state"])]["comp"].item():
+                rect = plt.Rectangle((x - 0.45, y - 0.45), 0.9, 0.9, 
+                                     facecolor="white", edgecolor="green", linewidth=4)
+            else:
+                rect = plt.Rectangle((x - 0.45, y - 0.45), 0.9, 0.9, 
+                                     facecolor="white", edgecolor="grey", linewidth=4)
+            ax.add_patch(rect)
+    
+        ax.plot([x, x], [y - 0.45, y + 0.45], color="black", linewidth=2.8, alpha=0.6)
+        
+        ax.plot([x  + (0.5 / scale) * tile_halfwidth, x + (0.5 / scale) * tile_halfwidth], [y - 0.45, y + 0.45],
+            color="black", linewidth=2.8, alpha=0.6, linestyle = "dotted")
+    
+        ax.plot([x  + (-0.5 / scale) * tile_halfwidth, x + (-0.5 / scale) * tile_halfwidth], [y - 0.45, y + 0.45],
+            color="black", linewidth=2.8, alpha=0.6, linestyle = "dotted")
+        
+
+        xmin = x + (row["dmin"] / scale) * tile_halfwidth
+        xmax = x + (row["dmax"] / scale) * tile_halfwidth
+        xmed = x + (row["dmedian"] / scale) * tile_halfwidth
+        y_offset = y + offsets[row["child_state"]]
+    
+        # draw horizontal range
+        ax.plot([xmin,xmax], [y_offset,y_offset], color=colors[row["child_state"]], linewidth=6)
+        ax.scatter(xmed,y_offset, color = colors[row["child_state"]],s=100,zorder=5)
+        priorset = currset
+
+    ax.set_xticks(range(0,len(x_levels)))
+    ax.set_xticklabels(x_levels)
+    ax.xaxis.tick_top()
+    ax.xaxis.set_label_position('top')
+    
+    ax.tick_params(axis='x', bottom=False, labelbottom=False,
+                   top=True, labeltop=True)
+    
+    ax.set_yticks(range(0,len(y_levels)))
+    ax.set_yticklabels(y_levels)
+    
+    ax.set_xlabel("Child node")
+    ax.set_ylabel("Parent state")
+    
+    ax.invert_yaxis()
+    
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    #plt.tight_layout()
+
     
 
-    for c, clip in enumerate(clips):
-        fig, axs = plt.subplots(1,2, figsize=(30,50)) 
-        causal_infTD = load_pickle(f"{datadir}causal_infTD_{str(clip)}")
-        causal_infASD = load_pickle(f"{datadir}causal_infASD_{str(clip)}")
-        
-        overlap = (causal_infTD[0]==causal_infASD[0]) & ~np.isnan(causal_infTD[0]) 
-        
-        plotStateChanges(*causal_infTD,overlap=overlap,
-                            fig=fig,ax = axs[0])
-        plotStateChanges(*causal_infTD,overlap=overlap,
-                            fig=fig,ax = axs[1])
-        if venn:
-            from matplotlib_venn import venn2, venn2_circles
-            n_overlap = np.sum(overlap)
-            n_TD = np.sum(causal_infTD[1]>0)
-            n_ASD = np.sum(causal_infASD[1]>0)
-            subsets = (n_TD, n_ASD, n_overlap) 
-            plt.figure(figsize=(15,15))
-            venn2(subsets=subsets, set_labels=["TD","ASD"], set_colors=("blue", "green"))
-            venn2_circles(subsets=subsets, linestyle="dashed", linewidth=5) 
-            plt.show()
-        n_epochs,overlap_dist,td_dist,asd_dist = quantify_cons_overlap(causal_infTD,
-                                                              causal_infASD,overlap)
-        dist_deltas.append({
-            "clip":clip,"dist":np.arange(0,n_epochs-1,1), "overlap_dist":overlap_dist, "td_dist":td_dist,
-            "asd_dist":asd_dist})
-        plt.show()
-    return dist_deltas
-            
+
+

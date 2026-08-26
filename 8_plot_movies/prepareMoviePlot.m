@@ -1,4 +1,4 @@
-function prepareMoviePlot(data,clip,movieDir,plotStates,bydx,targetCells,targetIdentity,pSize,saveDir)
+function prepareMoviePlot(data,clip,movieDir,plotStates,bydx,targetCells,targetIdentity,pSize,saveDir,frame,state)
 
 arguments
     data
@@ -10,7 +10,8 @@ arguments
     targetIdentity = []
     pSize = []
     saveDir = []
-    
+    frame = 0
+    state = 0
 end
 
 
@@ -43,7 +44,12 @@ if ~isempty(saveDir)
 end
 plotOpts.epochs = data{clipNum}.epochs;
 plotOpts.clip = clip;
-plotMovies(movieDir,coordsTD,coordsASD,plotOpts)
 
+if (frame == 0)
+    plotMovies(movieDir,coordsTD,coordsASD,plotOpts)
+else 
+    plotOpts.epochs = data{clipNum}.epochs;
+    plotOpts.state = state;
+    plotMovieFrame(movieDir,coordsTD,coordsASD,plotOpts,frame)
 
 end
