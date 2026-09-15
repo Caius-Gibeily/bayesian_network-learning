@@ -83,8 +83,8 @@ if ~isscalar(plotOpts.pSize)
     %pSizeTD = plotOpts.pSize(plotOpts.pSize(:,2)==j & plotOpts.pSize(:,1) == plotOpts.clusterArrayTD(:,j),3);
     %pSizeASD = plotOpts.pSize(plotOpts.pSize(:,2)==j & plotOpts.pSize(:,1) == plotOpts.clusterArrayTD(:,j),4);
 else
-    pSizeTD = 0.2;
-    pSizeASD = 0.2;
+    pSizeTD = plotOpts.pSize;
+    pSizeASD = plotOpts.pSize;
 end
 
 if plotOpts.bydx == 1
@@ -93,8 +93,13 @@ if plotOpts.bydx == 1
     colormap(cmap)
     axis off
 elseif plotOpts.bydx == 0 & ~isempty(plotOpts.clusterArrayTD)
-    scatter(coordsetTD(statesTD==plotOpts.state,1),coordsetTD(statesTD==plotOpts.state,2),"x","SizeData",pSizeTD*1000,"CData",cmap(statesTD(statesTD==plotOpts.state),:))
-    scatter(coordsetASD(statesASD==plotOpts.state,1),coordsetASD(statesASD==plotOpts.state,2),"+","SizeData",pSizeASD*1000,"CData",cmap(statesASD(statesASD==plotOpts.state),:))
+    if (plotOpts.state ~= 0) 
+        scatter(coordsetTD(statesTD==plotOpts.state,1),coordsetTD(statesTD==plotOpts.state,2),"x","SizeData",pSizeTD*1000,"CData",cmap(statesTD(statesTD==plotOpts.state),:))
+        scatter(coordsetASD(statesASD==plotOpts.state,1),coordsetASD(statesASD==plotOpts.state,2),"+","SizeData",pSizeASD*1000,"CData",cmap(statesASD(statesASD==plotOpts.state),:))
+    else 
+        scatter(coordsetTD(:,1),coordsetTD(:,2),"x","SizeData",pSizeTD*1000,"CData",cmap(statesTD,:))
+        scatter(coordsetASD(:,1),coordsetASD(:,2),"+","SizeData",pSizeASD*1000,"CData",cmap(statesASD,:))
+    end    
     colormap(cmap)
     axis off
 end

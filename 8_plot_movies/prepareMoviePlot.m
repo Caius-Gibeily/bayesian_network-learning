@@ -49,6 +49,7 @@ if (frame == 0)
     plotMovies(movieDir,coordsTD,coordsASD,plotOpts)
 else 
     plotOpts.epochs = data{clipNum}.epochs;
+    
     plotOpts.state = state;
     plotMovieFrame(movieDir,coordsTD,coordsASD,plotOpts,frame)
 
